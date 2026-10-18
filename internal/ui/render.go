@@ -1,4 +1,4 @@
-package main
+package ui
 
 import (
 	"fmt"
@@ -169,10 +169,12 @@ func (a *App) setRowCells(i int, r rowRef) {
 		switch {
 		case !a.docsLoaded:
 			docsText = "..."
-		case v.DocCount != "":
-			docsText, docsColor = v.DocCount+" docs", colorStatus
+		case v.DocCount == "":
+			docsText = "?" // count fetch failed or index missing from the response
+		case v.DocCount == "-":
+			docsText = "-"
 		default:
-			docsText = "0 docs"
+			docsText, docsColor = v.DocCount+" docs", colorStatus
 		}
 	}
 	a.table.SetCell(i, 3, tview.NewTableCell(indexText).SetTextColor(indexColor))
@@ -193,6 +195,11 @@ func (a *App) updateStatusView() {
 	case a.err != nil:
 		lines = append(lines, fmt.Sprintf("[red::B]Error: %s[-:-:-]", tview.Escape(a.err.Error())))
 		lines = append(lines, "[gray]Press q to quit, F1-F9 to switch env, 1-9 to switch module[-:-:-]")
+		// Keep operation results visible even when the follow-up reload failed.
+		if len(a.opResult) > 0 {
+			lines = append(lines, "[blue::B]Results:[-:-:-]")
+			lines = append(lines, a.opResult...)
+		}
 	case a.loading != "":
 		lines = append(lines, tview.Escape(a.loading))
 	default:
@@ -208,11 +215,14 @@ func (a *App) updateStatusView() {
 		}
 	}
 
-	height := len(lines)
+	// Over the cap, keep the newest lines (latest progress and failures) and
+	// replace the oldest with a marker.
 	const maxHeight = 15
-	if height > maxHeight {
-		height = maxHeight
+	if len(lines) > maxHeight {
+		skipped := len(lines) - maxHeight + 1
+		lines = append([]string{fmt.Sprintf("[gray]... %d earlier lines hidden[-:-:-]", skipped)}, lines[skipped:]...)
 	}
+	height := len(lines)
 	a.statusView.SetText(strings.Join(lines, "\n"))
 	a.flex.ResizeItem(a.statusView, height, 0)
 }

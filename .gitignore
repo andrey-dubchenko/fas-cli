@@ -1,4 +1,19 @@
-.idea
-/config.json
+# Build output
+/dist/
+/*.exe
 /fas-cli
-/fas-cli.exe
+*.test
+*.out
+coverage.*
+
+# Local configuration (copy config.example.json to config.json)
+/config.json
+
+# Editors and tools
+/.idea/
+/.vscode/
+/.claude/
+*.swp
+.DS_Store
+Thumbs.db
+/.codegraph/

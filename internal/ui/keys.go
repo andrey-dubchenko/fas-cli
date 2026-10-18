@@ -1,9 +1,12 @@
-package main
+package ui
 
 import (
 	"fmt"
+	"strings"
+	"unicode"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 // cyrillicShortcuts maps the Cyrillic letters that sit on the same physical
@@ -13,6 +16,7 @@ import (
 var cyrillicShortcuts = map[rune]rune{
 	'й': 'q', 'ы': 's', 'в': 'd', 'к': 'r', 'ь': 'm',
 	'у': 'e', 'д': 'l', 'ф': 'a', 'а': 'f', 'с': 'c', 'ч': 'x', 'р': 'h',
+	'о': 'j', 'л': 'k',
 }
 
 // handleKey is the single entry point for all keyboard input. It returns nil
@@ -26,6 +30,12 @@ func (a *App) handleKey(event *tcell.EventKey) *tcell.EventKey {
 		return event
 	}
 
+	// Ctrl+C must always work, even mid-operation with an unresponsive server.
+	if event.Key() == tcell.KeyCtrlC {
+		a.app.Stop()
+		return nil
+	}
+
 	if a.busy {
 		return nil
 	}
@@ -34,9 +44,6 @@ func (a *App) handleKey(event *tcell.EventKey) *tcell.EventKey {
 	case tcell.KeyEscape:
 		// Esc only closes modals (handled above); on the main screen it
 		// must not quit the whole app by accident.
-		return nil
-	case tcell.KeyCtrlC:
-		a.app.Stop()
 		return nil
 	case tcell.KeyEnter:
 		a.onEnter()
@@ -48,7 +55,9 @@ func (a *App) handleKey(event *tcell.EventKey) *tcell.EventKey {
 		idx := int(event.Key() - tcell.KeyF1)
 		if idx < len(a.config.Environments) && a.loading == "" {
 			if a.config.Environments[idx].Disabled {
-				a.err = fmt.Errorf("environment %s is disabled", a.config.Environments[idx].Name)
+				// A transient note rather than a.err, which would replace the
+				// whole status area until the next load.
+				a.opResult = []string{fmt.Sprintf("[red::B]  Environment %s is disabled[-:-:-]", tview.Escape(a.config.Environments[idx].Name))}
 				a.updateStatusView()
 			} else {
 				a.switchEnv(idx)
@@ -73,8 +82,24 @@ func (a *App) handleKey(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	}
 
-	if latin, ok := cyrillicShortcuts[r]; ok {
+	// Normalize Cyrillic layout and Caps Lock to the Latin lowercase
+	// shortcut. Other uppercase letters are left alone: the table itself
+	// binds some (e.g. 'G' for end).
+	orig := r
+	lower := unicode.ToLower(r)
+	if latin, ok := cyrillicShortcuts[lower]; ok {
 		r = latin
+	} else if strings.ContainsRune("qsdrmacfh", lower) {
+		r = lower
+	}
+
+	// While a (re)load is in flight the table shows stale data that is about
+	// to be replaced; don't let selection or operations act on it.
+	if a.loading != "" {
+		switch r {
+		case ' ', 's', 'd', 'r', 'm', 'a':
+			return nil
+		}
 	}
 
 	switch r {
@@ -99,6 +124,11 @@ func (a *App) handleKey(event *tcell.EventKey) *tcell.EventKey {
 	case '?', 'h':
 		a.openHelpModal()
 	default:
+		if r != orig {
+			// A layout-translated key that isn't ours (j/k navigation):
+			// hand the table the Latin rune it expects.
+			return tcell.NewEventKey(tcell.KeyRune, r, event.Modifiers())
+		}
 		return event
 	}
 	return nil

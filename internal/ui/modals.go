@@ -1,11 +1,14 @@
-package main
+package ui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"fas-cli/internal/config"
 )
 
 // indexOfString returns the index of target in items, or 0 if not found (a
@@ -44,7 +47,7 @@ func centeredModal(p tview.Primitive, width, height int) tview.Primitive {
 // disk and adopts it as the live config.
 func (a *App) openConfigModal() {
 	draft := a.config
-	draft.Environments = append([]Environment(nil), a.config.Environments...)
+	draft.Environments = append([]config.Environment(nil), a.config.Environments...)
 
 	envNames := make([]string, len(a.config.Environments))
 	for i, e := range a.config.Environments {
@@ -53,14 +56,22 @@ func (a *App) openConfigModal() {
 
 	form := tview.NewForm()
 
-	form.AddDropDown("Default module", a.config.Modules, indexOfString(a.config.Modules, a.config.DefaultModule),
-		func(option string, _ int) {
-			draft.DefaultModule = option
-		})
-	form.AddDropDown("Default environment", envNames, indexOfString(envNames, a.config.DefaultEnv),
-		func(option string, _ int) {
-			draft.DefaultEnv = option
-		})
+	// The dropdowns' callbacks also fire for the initial option, which would
+	// silently replace a stored default that isn't in the list with option 0.
+	// So read the choice back at Save time instead, and only apply it if the
+	// stored value was valid or the user actually moved off option 0.
+	form.AddDropDown("Default module", a.config.Modules, indexOfString(a.config.Modules, a.config.DefaultModule), nil)
+	form.AddDropDown("Default environment", envNames, indexOfString(envNames, a.config.DefaultEnv), nil)
+	applyDropDown := func(label string, options []string, stored string, dst *string) {
+		if len(options) == 0 {
+			return
+		}
+		dd := form.GetFormItemByLabel(label).(*tview.DropDown)
+		idx, opt := dd.GetCurrentOption()
+		if idx > 0 || slices.Contains(options, stored) {
+			*dst = opt
+		}
+	}
 	for i, env := range a.config.Environments {
 		i := i
 		form.AddCheckbox(fmt.Sprintf("Disable %s", env.Name), env.Disabled, func(checked bool) {
@@ -71,7 +82,9 @@ func (a *App) openConfigModal() {
 	closeForm := func() { a.closeModal(configPageName) }
 
 	form.AddButton("Save", func() {
-		if err := saveConfig(a.configPath, draft); err != nil {
+		applyDropDown("Default module", a.config.Modules, a.config.DefaultModule, &draft.DefaultModule)
+		applyDropDown("Default environment", envNames, a.config.DefaultEnv, &draft.DefaultEnv)
+		if err := config.Save(a.configPath, draft); err != nil {
 			a.err = fmt.Errorf("save config: %w", err)
 			a.updateStatusView()
 			return
@@ -81,13 +94,12 @@ func (a *App) openConfigModal() {
 		closeForm()
 	})
 	form.AddButton("Reload from disk", func() {
-		cfg, err := loadConfig(a.configPath)
+		cfg, err := config.Load(a.configPath)
 		if err != nil {
 			a.err = fmt.Errorf("reload config: %w", err)
 			a.updateStatusView()
 		} else {
-			a.config = cfg
-			a.refreshHeader()
+			a.applyReloadedConfig(cfg)
 		}
 		closeForm()
 	})
@@ -106,6 +118,46 @@ func (a *App) openConfigModal() {
 	height := numItems*2 + 1 /* buttons row */ + 2 /* border */ + 1 /* safety margin */
 	a.pages.AddPage(configPageName, centeredModal(form, 64, height), true, true)
 	a.app.SetFocus(form)
+}
+
+// applyReloadedConfig adopts a config re-read from disk: it keeps the active
+// environment and module valid for the new lists and reloads the data, since
+// URLs or the environment set may have changed underneath it.
+func (a *App) applyReloadedConfig(cfg config.Config) {
+	prevEnv := a.env().Name
+	a.config = cfg
+
+	// Keep the same environment by name if it still exists, else the first.
+	a.envIdx = 0
+	for i, e := range cfg.Environments {
+		if e.Name == prevEnv {
+			a.envIdx = i
+			break
+		}
+	}
+	if len(cfg.Modules) > 0 && !slices.Contains(cfg.Modules, a.module) {
+		a.module = cfg.Modules[0]
+		if cfg.DefaultModule != "" && slices.Contains(cfg.Modules, cfg.DefaultModule) {
+			a.module = cfg.DefaultModule
+		}
+	}
+
+	a.err = nil
+	a.opResult = nil
+	a.groups = nil
+	a.rows = nil
+	a.table.Clear()
+	a.refreshHeader()
+	a.updateHelp()
+	if len(cfg.Environments) == 0 {
+		a.loading = ""
+		a.loadGen++ // drop any in-flight load for the old config
+		a.updateStatusView()
+		return
+	}
+	a.loading = fmt.Sprintf("Loading schemas [%s]...", a.env().Name)
+	a.updateStatusView()
+	a.loadSchemas()
 }
 
 // openSearchModal shows a small input box that live-filters the table by

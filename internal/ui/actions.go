@@ -1,6 +1,23 @@
-package main
+package ui
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/rivo/tview"
+
+	"fas-cli/internal/flink"
+)
+
+// escapeLines neutralizes tview color tags in server-provided log lines
+// (response bodies often contain JSON like ["x"] that tview would parse).
+func escapeLines(lines []string) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = tview.Escape(l)
+	}
+	return out
+}
 
 // loadSchemas fetches the schema list for the current environment/module on
 // a goroutine and applies the result on the UI thread.
@@ -8,9 +25,14 @@ func (a *App) loadSchemas() {
 	env := a.env()
 	module := a.module
 	endpoints := a.config.Endpoints
+	a.loadGen++
+	gen := a.loadGen
 	go func() {
-		groups, err := fetchSchemas(a.client, env.FlinkAdmin, env.OpenSearch, module, endpoints)
+		groups, err := flink.FetchSchemas(a.client, env.FlinkAdmin, env.OpenSearch, module, endpoints)
 		a.app.QueueUpdateDraw(func() {
+			if gen != a.loadGen {
+				return // superseded by a newer load
+			}
 			if err != nil {
 				a.err = err
 				a.loading = ""
@@ -44,9 +66,13 @@ func (a *App) loadDocCounts() {
 		a.refreshTable()
 		return
 	}
+	gen := a.loadGen
 	go func() {
-		counts := fetchDocCounts(a.client, env.OpenSearch)
+		counts := flink.FetchDocCounts(a.client, env.OpenSearch)
 		a.app.QueueUpdateDraw(func() {
+			if gen != a.loadGen {
+				return // counts belong to a previous environment/module load
+			}
 			a.docsLoaded = true
 			if counts != nil {
 				for gi := range a.groups {
@@ -54,6 +80,9 @@ func (a *App) loadDocCounts() {
 						v := &a.groups[gi].Versions[vi]
 						if v.IndexName != "" {
 							if dc, ok := counts[v.IndexName]; ok {
+								if dc == "" {
+									dc = "-" // e.g. closed index: OpenSearch reports no count
+								}
 								v.DocCount = dc
 							}
 						}
@@ -86,7 +115,7 @@ func (a *App) switchEnv(idx int) {
 // runOps executes opType against items one at a time on a goroutine,
 // appending each step's log lines as they complete so the user sees live
 // progress, then reloads the schema list once the queue is drained.
-func (a *App) runOps(opType string, items []opItem) {
+func (a *App) runOps(opType string, items []flink.OpItem) {
 	if len(items) == 0 {
 		return
 	}
@@ -107,9 +136,9 @@ func (a *App) runOps(opType string, items []opItem) {
 		for _, item := range items {
 			cur := item
 			for {
-				lines, next := processNextOp(a.client, env.FlinkAdmin, env.OpenSearch, opType, cur, endpoints)
+				lines, next := flink.ProcessNextOp(a.client, env.FlinkAdmin, env.OpenSearch, opType, cur, endpoints)
 				a.app.QueueUpdateDraw(func() {
-					a.opResult = append(a.opResult, lines...)
+					a.opResult = append(a.opResult, escapeLines(lines)...)
 					a.updateStatusView()
 				})
 				if next == nil {
@@ -136,9 +165,9 @@ func (a *App) runMoveAlias(opensearchURL, src, dst string, aliases []string) {
 	a.updateStatusView()
 
 	go func() {
-		lines := moveAlias(a.client, opensearchURL, src, dst, aliases)
+		lines := flink.MoveAlias(a.client, opensearchURL, src, dst, aliases)
 		a.app.QueueUpdateDraw(func() {
-			a.opResult = append(a.opResult, lines...)
+			a.opResult = append(a.opResult, escapeLines(lines)...)
 			a.busy = false
 			a.busyMsg = ""
 			a.loading = "Reloading schemas..."
@@ -244,15 +273,70 @@ func (a *App) onSpace() {
 }
 
 func (a *App) onS() {
-	a.runOps("stop", collectSelected(a.groups))
+	a.confirmOps("stop", flink.CollectSelected(a.groups))
 }
 
 func (a *App) onD() {
-	a.runOps("delete", collectSelected(a.groups))
+	a.confirmOps("delete", flink.CollectSelected(a.groups))
 }
 
 func (a *App) onR() {
-	a.runOps("restart", collectSelected(a.groups))
+	a.confirmOps("restart", flink.CollectSelected(a.groups))
+}
+
+// confirmOps asks for confirmation before running opType. Selection can
+// include versions hidden by the search filter or inside collapsed groups,
+// so the dialog states the total and how many of them are not on screen.
+// Focus starts on Cancel so a stray Enter never confirms.
+func (a *App) confirmOps(opType string, items []flink.OpItem) {
+	if len(items) == 0 {
+		return
+	}
+
+	visible := make(map[rowRef]bool, len(a.rows))
+	for _, r := range a.rows {
+		visible[r] = true
+	}
+	hidden := 0
+	for gi, g := range a.groups {
+		for vi, v := range g.Versions {
+			if v.Selected && !visible[rowRef{groupIdx: gi, versionIdx: vi}] {
+				hidden++
+			}
+		}
+	}
+
+	verb := map[string]string{"stop": "Stop", "restart": "Restart", "delete": "DELETE (schema and index)"}[opType]
+	env := a.env()
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s %d selected version(s) on %s?\n\n", verb, len(items), tview.Escape(env.Name))
+	const maxListed = 8
+	for i, it := range items {
+		if i == maxListed {
+			fmt.Fprintf(&sb, "... and %d more\n", len(items)-maxListed)
+			break
+		}
+		fmt.Fprintf(&sb, "%s/%s\n", tview.Escape(it.Name), tview.Escape(it.Version))
+	}
+	if hidden > 0 {
+		fmt.Fprintf(&sb, "\n[red::B]%d of them are not visible (filtered out or collapsed)![-:-:-]", hidden)
+	}
+	if strings.EqualFold(env.Name, "PROD") {
+		sb.WriteString("\n[red::B]This is PROD.[-:-:-]")
+	}
+
+	modal := tview.NewModal().
+		SetText(sb.String()).
+		AddButtons([]string{"Cancel", "Confirm"}).
+		SetDoneFunc(func(idx int, _ string) {
+			a.closeModal(confirmPageName)
+			if idx == 1 {
+				a.runOps(opType, items)
+			}
+		})
+	a.pages.AddPage(confirmPageName, modal, true, true)
+	a.app.SetFocus(modal)
 }
 
 func (a *App) selectModule(idx int) {

@@ -1,12 +1,16 @@
-package main
+package ui
 
 import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"fas-cli/internal/config"
+	"fas-cli/internal/flink"
 )
 
 // Table cell colors, named via tcell's W3C color set. Colors used only in
@@ -27,6 +31,8 @@ const (
 	configPageName = "config"
 	searchPageName = "search"
 	helpPageName   = "help"
+
+	confirmPageName = "confirm"
 )
 
 // rowRef identifies one visible line in the table: either a schema group
@@ -48,15 +54,16 @@ type App struct {
 	helpView   *tview.TextView
 	flex       *tview.Flex
 
-	config     Config
+	config     config.Config
 	configPath string
 	envIdx     int
 	module     string
 	client     *http.Client
 
-	groups     []SchemaGroup
+	groups     []flink.SchemaGroup
 	rows       []rowRef
 	docsLoaded bool
+	loadGen    int // bumped on every loadSchemas; stale async results are dropped
 
 	err     error
 	loading string
@@ -71,9 +78,9 @@ type App struct {
 // env returns the currently selected environment, or a zero-value
 // Environment if none are configured yet (empty flinkAdmin/opensearch URLs,
 // which every network-calling function already treats as "nothing to do").
-func (a *App) env() Environment {
+func (a *App) env() config.Environment {
 	if a.envIdx < 0 || a.envIdx >= len(a.config.Environments) {
-		return Environment{}
+		return config.Environment{}
 	}
 	return a.config.Environments[a.envIdx]
 }
@@ -83,10 +90,12 @@ func (a *App) env() Environment {
 // the schema table taking whatever space is left (proportion 1, so it never
 // needs manual height math), a variable-height status/results strip, and a
 // fixed help bar at the bottom.
-func NewApp(module string, cfg Config, envIdx int, cfgPath string) *App {
+func NewApp(module string, cfg config.Config, envIdx int, cfgPath string) *App {
+	// The timeout keeps a hung server from freezing the UI in the busy state.
 	client := &http.Client{
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
 		},
 	}
 

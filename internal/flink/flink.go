@@ -1,4 +1,4 @@
-package main
+package flink
 
 import (
 	"bytes"
@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"fas-cli/internal/config"
 )
 
 // pageSize is the page size used when paging through Flink's schema list API.
@@ -65,19 +68,19 @@ type SchemaGroup struct {
 
 // Pending operation item
 
-type opItem struct {
-	name      string
-	version   string
-	indexName string
-	subOp     string // for restart: "stop" or "start", empty for other ops
+type OpItem struct {
+	Name      string
+	Version   string
+	IndexName string
+	SubOp     string // for restart: "stop" or "start", empty for other ops
 }
 
 // Backend calls are synchronous. The App runs them on goroutines and marshals
 // results back to the UI thread via Application.QueueUpdateDraw.
 
-// schemaPath substitutes the "{name}"/"{version}" placeholders in a
+// SchemaPath substitutes the "{name}"/"{version}" placeholders in a
 // configured endpoint template with URL-escaped values.
-func schemaPath(template, name, version string) string {
+func SchemaPath(template, name, version string) string {
 	p := strings.ReplaceAll(template, "{name}", url.PathEscape(name))
 	p = strings.ReplaceAll(p, "{version}", url.PathEscape(version))
 	return p
@@ -114,9 +117,9 @@ func fetchAliases(client *http.Client, opensearchURL string) (map[string][]strin
 	return result, nil
 }
 
-// fetchDocCounts silently returns nil on any failure: document counts are a
+// FetchDocCounts silently returns nil on any failure: document counts are a
 // best-effort annotation, not worth blocking or erroring the whole UI over.
-func fetchDocCounts(client *http.Client, opensearchURL string) map[string]string {
+func FetchDocCounts(client *http.Client, opensearchURL string) map[string]string {
 	resp, err := client.Get(opensearchURL + "/_cat/indices?format=json&h=index,docs.count")
 	if err != nil {
 		return nil
@@ -139,7 +142,7 @@ func fetchDocCounts(client *http.Client, opensearchURL string) map[string]string
 	return counts
 }
 
-func fetchSchemas(client *http.Client, flinkURL, opensearchURL, module string, endpoints Endpoints) ([]SchemaGroup, error) {
+func FetchSchemas(client *http.Client, flinkURL, opensearchURL, module string, endpoints config.Endpoints) ([]SchemaGroup, error) {
 	var allSchemas []SchemaShort
 	page := 0
 	for {
@@ -181,7 +184,7 @@ func fetchSchemas(client *http.Client, flinkURL, opensearchURL, module string, e
 	if opensearchURL == "" {
 		// No OpenSearch configured for this environment: schemas just won't
 		// show an index/alias, rather than failing the whole load.
-		return groupSchemas(allSchemas, nil), nil
+		return GroupSchemas(allSchemas, nil), nil
 	}
 
 	aliases, err := fetchAliases(client, opensearchURL)
@@ -189,10 +192,10 @@ func fetchSchemas(client *http.Client, flinkURL, opensearchURL, module string, e
 		return nil, err
 	}
 
-	return groupSchemas(allSchemas, aliases), nil
+	return GroupSchemas(allSchemas, aliases), nil
 }
 
-func findIndex(name, version string, aliases map[string][]string) (string, []string) {
+func FindIndex(name, version string, aliases map[string][]string) (string, []string) {
 	candidates := []string{
 		strings.ToLower(name) + "-" + strings.ToLower(version),
 		strings.ToLower(name) + "_" + strings.ToLower(version),
@@ -212,10 +215,10 @@ func findIndex(name, version string, aliases map[string][]string) (string, []str
 	return "", nil
 }
 
-func groupSchemas(schemas []SchemaShort, aliases map[string][]string) []SchemaGroup {
+func GroupSchemas(schemas []SchemaShort, aliases map[string][]string) []SchemaGroup {
 	grouped := make(map[string][]VersionItem)
 	for _, s := range schemas {
-		idxName, idxAliases := findIndex(s.Name, s.Version, aliases)
+		idxName, idxAliases := FindIndex(s.Name, s.Version, aliases)
 		grouped[s.Name] = append(grouped[s.Name], VersionItem{
 			Version:   s.Version,
 			Status:    s.Status,
@@ -227,7 +230,7 @@ func groupSchemas(schemas []SchemaShort, aliases map[string][]string) []SchemaGr
 	groups := make([]SchemaGroup, 0, len(grouped))
 	for name, versions := range grouped {
 		sort.Slice(versions, func(i, j int) bool {
-			return versions[i].Version < versions[j].Version
+			return CompareVersions(versions[i].Version, versions[j].Version) < 0
 		})
 		groups = append(groups, SchemaGroup{
 			Name:     name,
@@ -240,98 +243,81 @@ func groupSchemas(schemas []SchemaShort, aliases map[string][]string) []SchemaGr
 	return groups
 }
 
-// processNextOp performs one HTTP step for opType against item and returns
+// ProcessNextOp performs one HTTP step for opType against item and returns
 // the log lines produced. For "restart" it returns nextOp non-nil after the
 // stop half completes, so the caller can chain the start half.
-func processNextOp(client *http.Client, flinkURL, opensearchURL, opType string, item opItem, endpoints Endpoints) (lines []string, nextOp *opItem) {
+func ProcessNextOp(client *http.Client, flinkURL, opensearchURL, opType string, item OpItem, endpoints config.Endpoints) (lines []string, nextOp *OpItem) {
 	switch opType {
 	case "restart":
 		// Handle restart as a composite operation: stop then start
-		if item.subOp == "" {
-			item.subOp = "stop"
+		if item.SubOp == "" {
+			item.SubOp = "stop"
 		}
-		if item.subOp == "stop" {
-			u := flinkURL + schemaPath(endpoints.SchemaStop, item.name, item.version)
-			req, _ := http.NewRequest("POST", u, nil)
-			resp, err := client.Do(req)
-			if err != nil {
-				lines = append(lines, fmt.Sprintf("  FAIL %s/%s: %v", item.name, item.version, err))
-			} else {
-				body, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if resp.StatusCode == 204 {
-					lines = append(lines, fmt.Sprintf("  OK   %s/%s stopped", item.name, item.version))
-					// Queue the start operation
-					item.subOp = "start"
-					return lines, &item
-				}
-				lines = append(lines, fmt.Sprintf("  FAIL %s/%s: HTTP %d %s", item.name, item.version, resp.StatusCode, string(body)))
+		if item.SubOp == "stop" {
+			l, ok := stopSchema(client, flinkURL, item, endpoints)
+			lines = append(lines, l)
+			if ok {
+				// Queue the start operation
+				item.SubOp = "start"
+				return lines, &item
 			}
-		} else if item.subOp == "start" {
-			u := flinkURL + schemaPath(endpoints.SchemaStart, item.name, item.version)
-			reqBody := []byte(`{"startArg":[]}`)
-			req, _ := http.NewRequest("POST", u, bytes.NewReader(reqBody))
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
-			if err != nil {
-				lines = append(lines, fmt.Sprintf("  FAIL %s/%s start: %v", item.name, item.version, err))
-			} else {
-				body, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if resp.StatusCode == 204 {
-					lines = append(lines, fmt.Sprintf("  OK   %s/%s started", item.name, item.version))
-				} else {
-					lines = append(lines, fmt.Sprintf("  FAIL %s/%s start: HTTP %d %s", item.name, item.version, resp.StatusCode, string(body)))
+		} else if item.SubOp == "start" {
+			// The stop endpoint can return before the job has actually
+			// stopped, in which case an immediate start is rejected. Retry a
+			// few times with a short pause before reporting failure.
+			const attempts = 3
+			for i := 1; i <= attempts; i++ {
+				status, body, err := callAPI(client, "POST", flinkURL+SchemaPath(endpoints.SchemaStart, item.Name, item.Version), []byte(`{"startArg":[]}`))
+				if err == nil && status >= 200 && status < 300 {
+					lines = append(lines, fmt.Sprintf("  OK   %s/%s started", item.Name, item.Version))
+					break
 				}
+				if i == attempts {
+					if err != nil {
+						lines = append(lines, fmt.Sprintf("  FAIL %s/%s start: %v", item.Name, item.Version, err))
+					} else {
+						lines = append(lines, fmt.Sprintf("  FAIL %s/%s start: HTTP %d %s", item.Name, item.Version, status, body))
+					}
+					break
+				}
+				time.Sleep(2 * time.Second)
 			}
 		}
 
 	case "stop":
-		u := flinkURL + schemaPath(endpoints.SchemaStop, item.name, item.version)
-		req, _ := http.NewRequest("POST", u, nil)
-		resp, err := client.Do(req)
-		if err != nil {
-			lines = append(lines, fmt.Sprintf("  FAIL %s/%s: %v", item.name, item.version, err))
-		} else {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == 204 {
-				lines = append(lines, fmt.Sprintf("  OK   %s/%s stopped", item.name, item.version))
-			} else {
-				lines = append(lines, fmt.Sprintf("  FAIL %s/%s: HTTP %d %s", item.name, item.version, resp.StatusCode, string(body)))
-			}
-		}
+		l, _ := stopSchema(client, flinkURL, item, endpoints)
+		lines = append(lines, l)
 
 	case "delete":
-		u := flinkURL + schemaPath(endpoints.SchemaDelete, item.name, item.version) + "?deleteIndex=false"
+		u := flinkURL + SchemaPath(endpoints.SchemaDelete, item.Name, item.Version) + "?deleteIndex=false"
 		req, _ := http.NewRequest("DELETE", u, nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			lines = append(lines, fmt.Sprintf("  FAIL %s/%s schema delete: %v", item.name, item.version, err))
+			lines = append(lines, fmt.Sprintf("  FAIL %s/%s schema delete: %v", item.Name, item.Version, err))
 			return lines, nil
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			lines = append(lines, fmt.Sprintf("  OK   %s/%s schema deleted", item.name, item.version))
+			lines = append(lines, fmt.Sprintf("  OK   %s/%s schema deleted", item.Name, item.Version))
 		} else {
-			lines = append(lines, fmt.Sprintf("  FAIL %s/%s schema delete: HTTP %d %s", item.name, item.version, resp.StatusCode, string(body)))
+			lines = append(lines, fmt.Sprintf("  FAIL %s/%s schema delete: HTTP %d %s", item.Name, item.Version, resp.StatusCode, string(body)))
 			return lines, nil
 		}
 
-		if item.indexName != "" {
-			idxURL := fmt.Sprintf("%s/%s", opensearchURL, url.PathEscape(item.indexName))
+		if item.IndexName != "" {
+			idxURL := fmt.Sprintf("%s/%s", opensearchURL, url.PathEscape(item.IndexName))
 			req, _ := http.NewRequest("DELETE", idxURL, nil)
 			resp, err := client.Do(req)
 			if err != nil {
-				lines = append(lines, fmt.Sprintf("  FAIL %s/%s index delete (%s): %v", item.name, item.version, item.indexName, err))
+				lines = append(lines, fmt.Sprintf("  FAIL %s/%s index delete (%s): %v", item.Name, item.Version, item.IndexName, err))
 			} else {
 				body, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					lines = append(lines, fmt.Sprintf("  OK   %s/%s index deleted (%s)", item.name, item.version, item.indexName))
+					lines = append(lines, fmt.Sprintf("  OK   %s/%s index deleted (%s)", item.Name, item.Version, item.IndexName))
 				} else {
-					lines = append(lines, fmt.Sprintf("  FAIL %s/%s index delete (%s): HTTP %d %s", item.name, item.version, item.indexName, resp.StatusCode, string(body)))
+					lines = append(lines, fmt.Sprintf("  FAIL %s/%s index delete (%s): HTTP %d %s", item.Name, item.Version, item.IndexName, resp.StatusCode, string(body)))
 				}
 			}
 		}
@@ -340,15 +326,92 @@ func processNextOp(client *http.Client, flinkURL, opensearchURL, opType string, 
 	return lines, nil
 }
 
-func collectSelected(groups []SchemaGroup) []opItem {
-	var items []opItem
+// callAPI performs one request and returns the status code and body text.
+func callAPI(client *http.Client, method, u string, body []byte) (int, string, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, u, rdr)
+	if err != nil {
+		return 0, "", err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b), nil
+}
+
+// stopSchema stops one schema and returns the log line plus whether it
+// succeeded. Any 2xx counts as success.
+func stopSchema(client *http.Client, flinkURL string, item OpItem, endpoints config.Endpoints) (string, bool) {
+	status, body, err := callAPI(client, "POST", flinkURL+SchemaPath(endpoints.SchemaStop, item.Name, item.Version), nil)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("  FAIL %s/%s: %v", item.Name, item.Version, err), false
+	case status >= 200 && status < 300:
+		return fmt.Sprintf("  OK   %s/%s stopped", item.Name, item.Version), true
+	default:
+		return fmt.Sprintf("  FAIL %s/%s: HTTP %d %s", item.Name, item.Version, status, body), false
+	}
+}
+
+// CompareVersions orders version strings naturally: digit runs compare as
+// numbers, so "1.9" < "1.10" and "2" < "10".
+func CompareVersions(a, b string) int {
+	for a != "" && b != "" {
+		da, db := a[0] >= '0' && a[0] <= '9', b[0] >= '0' && b[0] <= '9'
+		if da && db {
+			na, ra := splitDigits(a)
+			nb, rb := splitDigits(b)
+			na, nb = strings.TrimLeft(na, "0"), strings.TrimLeft(nb, "0")
+			if len(na) != len(nb) {
+				if len(na) < len(nb) {
+					return -1
+				}
+				return 1
+			}
+			if c := strings.Compare(na, nb); c != 0 {
+				return c
+			}
+			a, b = ra, rb
+			continue
+		}
+		if a[0] != b[0] {
+			if a[0] < b[0] {
+				return -1
+			}
+			return 1
+		}
+		a, b = a[1:], b[1:]
+	}
+	return strings.Compare(a, b)
+}
+
+// splitDigits splits s into its leading digit run and the remainder.
+func splitDigits(s string) (string, string) {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	return s[:i], s[i:]
+}
+
+func CollectSelected(groups []SchemaGroup) []OpItem {
+	var items []OpItem
 	for _, g := range groups {
 		for _, v := range g.Versions {
 			if v.Selected {
-				items = append(items, opItem{
-					name:      g.Name,
-					version:   v.Version,
-					indexName: v.IndexName,
+				items = append(items, OpItem{
+					Name:      g.Name,
+					Version:   v.Version,
+					IndexName: v.IndexName,
 				})
 			}
 		}
@@ -356,7 +419,7 @@ func collectSelected(groups []SchemaGroup) []opItem {
 	return items
 }
 
-func moveAlias(client *http.Client, opensearchURL, srcIndex, dstIndex string, aliases []string) []string {
+func MoveAlias(client *http.Client, opensearchURL, srcIndex, dstIndex string, aliases []string) []string {
 	type aliasAction struct {
 		Index string `json:"index"`
 		Alias string `json:"alias"`

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=fas-cli
+GenericName=Flink schema manager
+Comment=Manage Flink Admin schemas and OpenSearch indices from the terminal
+Exec=fas-cli
+Icon=fas-cli
+Terminal=true
+Categories=Development;System;
+Keywords=flink;opensearch;schema;

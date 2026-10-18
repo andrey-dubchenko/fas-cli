@@ -1,0 +1,32 @@
+{
+  "modules": ["module-a", "module-b"],
+  "defaultModule": "module-a",
+  "defaultEnv": "TEST",
+  "insecureSkipVerify": false,
+  "endpoints": {
+    "schemaList": "/v2/schema/short",
+    "schemaStop": "/v2/schema/{name}/{version}/stop",
+    "schemaStart": "/v2/schema/{name}/{version}/start",
+    "schemaDelete": "/v2/schema/{name}/{version}"
+  },
+  "environments": [
+    {
+      "name": "DEV",
+      "flinkAdmin": "https://flink-admin.dev.example.com/flink/admin",
+      "opensearch": "http://opensearch.dev.example.com:9200",
+      "disabled": true
+    },
+    {
+      "name": "TEST",
+      "flinkAdmin": "https://flink-admin.test.example.com/flink/admin",
+      "opensearch": "http://opensearch.test.example.com:9200",
+      "disabled": false
+    },
+    {
+      "name": "PROD",
+      "flinkAdmin": "https://flink-admin.prod.example.com/flink/admin",
+      "opensearch": "http://opensearch.prod.example.com:9200",
+      "disabled": true
+    }
+  ]
+}

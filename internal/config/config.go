@@ -1,9 +1,10 @@
-package main
+package config
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Config types
@@ -21,6 +22,10 @@ type Config struct {
 	DefaultEnv    string        `json:"defaultEnv"`    // environment name used on startup
 	Environments  []Environment `json:"environments"`
 	Endpoints     Endpoints     `json:"endpoints"` // Flink Admin API path templates
+
+	// InsecureSkipVerify disables TLS certificate verification for every
+	// request. Off by default; enable only for self-signed internal hosts.
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
 }
 
 // Endpoints holds the Flink Admin API path templates the app calls.
@@ -36,7 +41,7 @@ type Endpoints struct {
 	SchemaDelete string `json:"schemaDelete,omitempty"` // DELETE, ?deleteIndex=false appended
 }
 
-func defaultEndpoints() Endpoints {
+func DefaultEndpoints() Endpoints {
 	return Endpoints{
 		SchemaList:   "/v2/schema/short",
 		SchemaStop:   "/v2/schema/{name}/{version}/stop",
@@ -45,11 +50,11 @@ func defaultEndpoints() Endpoints {
 	}
 }
 
-// fillDefaults replaces any blank template with its v2 default, so
+// FillDefaults replaces any blank template with its v2 default, so
 // config.json files written before Endpoints existed (or with some fields
 // left out) keep working unchanged.
-func (e *Endpoints) fillDefaults() {
-	d := defaultEndpoints()
+func (e *Endpoints) FillDefaults() {
+	d := DefaultEndpoints()
 	if e.SchemaList == "" {
 		e.SchemaList = d.SchemaList
 	}
@@ -64,23 +69,23 @@ func (e *Endpoints) fillDefaults() {
 	}
 }
 
-// defaultConfig is written to disk the first time the app runs with no
+// Default is written to disk the first time the app runs with no
 // config.json. It's deliberately a blank slate rather than a set of
 // plausible-looking example environments: fake URLs that don't correspond
 // to any real deployment are more likely to confuse a new user than an
 // honest "nothing configured yet". Endpoints are left blank on disk too;
-// loadConfig fills in the real defaults in memory via fillDefaults.
-func defaultConfig() Config {
+// Load fills in the real defaults in memory via FillDefaults.
+func Default() Config {
 	return Config{
 		Modules:       []string{},
-		DefaultModule: "DEFAULT",
-		DefaultEnv:    "DEFAULT",
+		DefaultModule: "",
+		DefaultEnv:    "",
 		Environments:  []Environment{},
 		Endpoints:     Endpoints{},
 	}
 }
 
-func saveConfig(path string, cfg Config) error {
+func Save(path string, cfg Config) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -91,20 +96,20 @@ func saveConfig(path string, cfg Config) error {
 	return nil
 }
 
-func loadConfig(path string) (Config, error) {
+func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Generate default config if file doesn't exist
-			cfg := defaultConfig()
-			if err := saveConfig(path, cfg); err != nil {
+			cfg := Default()
+			if err := Save(path, cfg); err != nil {
 				return Config{}, fmt.Errorf("create default config: %w", err)
 			}
-			// The file on disk stays a blank slate (see defaultConfig), but
+			// The file on disk stays a blank slate (see Default), but
 			// the in-memory Endpoints still need real values so schema
 			// operations work the moment an environment is added, without
-			// requiring a restart to pick up fillDefaults from a re-read.
-			cfg.Endpoints.fillDefaults()
+			// requiring a restart to pick up FillDefaults from a re-read.
+			cfg.Endpoints.FillDefaults()
 			return cfg, nil
 		}
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -119,6 +124,12 @@ func loadConfig(path string) (Config, error) {
 	// crashing, so a bare-bones config like this is a valid starting point:
 	//
 	//	{"modules": [], "environments": [], "endpoints": {}}
-	cfg.Endpoints.fillDefaults()
+	cfg.Endpoints.FillDefaults()
+	// URLs are joined with "/v2/..." style paths, so a trailing slash in the
+	// config would produce "//v2/...".
+	for i := range cfg.Environments {
+		cfg.Environments[i].FlinkAdmin = strings.TrimRight(cfg.Environments[i].FlinkAdmin, "/")
+		cfg.Environments[i].OpenSearch = strings.TrimRight(cfg.Environments[i].OpenSearch, "/")
+	}
 	return cfg, nil
 }

@@ -1,6 +1,6 @@
 # FAS CLI: Flink Admin Schema Manager
 
-**v1.0.0** | [Andrey Dubchenko](https://github.com/andrey-dubchenko) | [Stanislav Agarkov](https://github.com/agarkoff)
+**v1.4.0** | [Andrey Dubchenko](https://github.com/andrey-dubchenko) | [Stanislav Agarkov](https://github.com/agarkoff)
 
 An interactive terminal application for managing Apache Flink schemas, projections, and ReadViews across multiple environments.
 
@@ -20,7 +20,7 @@ An interactive terminal application for managing Apache Flink schemas, projectio
 
 ## Requirements
 
-- Go 1.25.4+
+- Go 1.27.2+
 - Access to a Flink Admin API (schema management endpoints)
 - Access to OpenSearch (optional, see "Configuration" below)
 
@@ -32,6 +32,35 @@ An interactive terminal application for managing Apache Flink schemas, projectio
 git clone <repository>
 cd fas-cli
 go build -o fas-cli ./cmd/fas-cli
+```
+
+### Build with make
+
+`make` works on Windows (it hands every target to `make.ps1`) and on Linux/macOS.
+
+| Command | Result |
+|---|---|
+| `make` | build for this machine (on Windows, `fas-cli.exe` with the icon) |
+| `make windows` | `dist/windows-amd64/fas-cli.exe` + `config.example.json` |
+| `make linux` | `dist/linux-amd64/`: binary, desktop entry, icons, `install.sh`, `config.example.json` |
+| `make dist` | both of the above |
+| `make check` | gofmt + go vet + tests |
+| `make icons` | redraw `assets/icon.ico`, `assets/icon.svg` and the PNG icons (`go run assets/genicon.go`) |
+| `make resources` | recompile the Windows resources (`assets/fas-cli.rc`, needs `windres` from MinGW) |
+| `make VERSION=1.2.0 build` | set the version printed by `fas-cli -version` (default: `git describe`) |
+
+On Linux, copy `dist/linux-amd64` to the target machine and run `sh install.sh` to install the binary, the desktop entry and the icons into `~/.local` (`PREFIX=/usr/local sh install.sh` for system-wide, `sh install.sh uninstall` to remove).
+
+### Project layout
+
+```
+cmd/fas-cli/          entry point: flags, config discovery, wiring (+ Windows resources)
+internal/config/      config.json types, load/save, defaults
+internal/flink/       Flink Admin and OpenSearch API client, schema grouping, operations
+internal/ui/          the tview terminal UI: table, keys, modals, status
+test/                 tests, one folder per package (external `<pkg>_test` packages)
+assets/               icon generator, icon.ico/icon.svg, PNG icons, Windows .rc
+packaging/linux/      desktop entry and install.sh
 ```
 
 ### Usage
@@ -55,7 +84,7 @@ go build -o fas-cli ./cmd/fas-cli
    - `config.json` in the current directory
    - `config.json` next to the executable
    - `config.json` in the working directory
-3. **If no file is found, the app creates an empty one** (no modules, no environments; add them yourself, see below).
+3. **If no file is found, the app creates an empty one** (no modules, no environments) next to the executable and says so on startup. It is easier to start from `config.example.json` (see "Configuration" below) than to fill an empty file by hand.
 
 **Examples:**
 ```bash
@@ -76,11 +105,22 @@ go build -o fas-cli ./cmd/fas-cli
 
 ### config.json
 
+`config.json` is your local, per-machine configuration and is not committed (it is in `.gitignore`). The repository ships a template with placeholder hosts, [config.example.json](config.example.json); it is also copied next to the binary by `make windows` / `make linux` (`dist/...`).
+
+**Getting started:**
+
+```bash
+cp config.example.json config.json      # Windows: copy config.example.json config.json
+```
+
+Then edit `config.json`: list your real modules, replace the `example.com` hosts with your Flink Admin and OpenSearch URLs, and set `defaultModule` / `defaultEnv`. The template looks like this:
+
 ```json
 {
-  "modules": ["moduleA", "moduleB"],
-  "defaultModule": "moduleA",
+  "modules": ["module-a", "module-b"],
+  "defaultModule": "module-a",
   "defaultEnv": "TEST",
+  "insecureSkipVerify": false,
   "endpoints": {
     "schemaList": "/v2/schema/short",
     "schemaStop": "/v2/schema/{name}/{version}/stop",
@@ -90,20 +130,20 @@ go build -o fas-cli ./cmd/fas-cli
   "environments": [
     {
       "name": "DEV",
-      "flinkAdmin": "https://flink-admin.example.com",
-      "opensearch": "https://opensearch.example.com",
-      "disabled": false
+      "flinkAdmin": "https://flink-admin.dev.example.com/flink/admin",
+      "opensearch": "http://opensearch.dev.example.com:9200",
+      "disabled": true
     },
     {
       "name": "TEST",
-      "flinkAdmin": "https://flink-admin.test.example.com",
-      "opensearch": "https://opensearch.test.example.com",
+      "flinkAdmin": "https://flink-admin.test.example.com/flink/admin",
+      "opensearch": "http://opensearch.test.example.com:9200",
       "disabled": false
     },
     {
       "name": "PROD",
-      "flinkAdmin": "https://flink-admin.prod.example.com",
-      "opensearch": "https://opensearch.prod.example.com",
+      "flinkAdmin": "https://flink-admin.prod.example.com/flink/admin",
+      "opensearch": "http://opensearch.prod.example.com:9200",
       "disabled": true
     }
   ]
@@ -114,12 +154,13 @@ go build -o fas-cli ./cmd/fas-cli
 - `modules`: list of available modules. Optional: if it's missing or empty, no module filter is applied (jobs/schemas from every module are shown), and the `1-9` module switch is disabled.
 - `defaultModule`: module used on startup.
 - `defaultEnv`: environment used on startup.
+- `insecureSkipVerify`: optional, default `false`. Set to `true` to skip TLS certificate verification (needed for hosts with self-signed certificates).
 - `environments`: can also be empty. The minimal valid config looks like this:
   ```json
   {
     "modules": [],
-    "defaultModule": "DEFAULT",
-    "defaultEnv": "DEFAULT",
+    "defaultModule": "",
+    "defaultEnv": "",
     "environments": [],
     "endpoints": {}
   }
@@ -179,6 +220,8 @@ The `opensearch` field can be left as an empty string. In that case:
 | `c` | **Config**: open the config editor | |
 | `?` / `h` | Show the full keyboard shortcut reference | |
 | `q` / `Ctrl+C` | Quit | |
+
+`s`, `r` and `d` ask for confirmation first: the dialog lists the selected versions, warns when some of them are hidden (filtered out or in a collapsed group) and when the environment is `PROD`. Focus starts on **Cancel**. `Ctrl+C` quits even while an operation is running; requests time out after 30 s.
 
 Letter shortcuts work regardless of keyboard layout: both a US layout and a Cyrillic (ЙЦУКЕН) layout work.
 
@@ -323,7 +366,7 @@ F1:DEV  F2:TEST  F3:UAT  F4:INT  F5:PROD [disabled]
 
 Trying to switch to a disabled environment shows:
 ```
-environment PROD is disabled
+Environment PROD is disabled
 ```
 
 ## Interface
@@ -401,20 +444,20 @@ Fix: check that the module and schema name are correct.
 
 ## Code layout
 
-The interface is built on [tview](https://github.com/rivo/tview)/[tcell](https://github.com/gdamore/tcell). Sources live in `cmd/fas-cli/`:
+The interface is built on [tview](https://github.com/rivo/tview)/[tcell](https://github.com/gdamore/tcell). Sources are split into packages (the same layout as the "Project layout" above):
 
 ```
-cmd/fas-cli/
-|-- main.go      entry point: flags, finding and loading config.json
-|-- config.go    Config, Environment, reading/writing config.json
-|-- flink.go     Flink/OpenSearch response types and all backend calls
-|                (fetchSchemas, processNextOp, moveAlias, ...)
-|-- app.go       the App struct, tview widget setup (NewApp/Run)
-|-- render.go    UI redraws: header, table, status panel, help bar
-|-- actions.go   action handlers: stop/restart/delete/move,
-|                environment/module switching
-|-- keys.go      layout-independent keyboard shortcuts (handleKey)
-`-- modals.go    modal dialogs: config, search, help
+cmd/fas-cli/main.go          entry point: flags, finding and loading config.json
+internal/config/config.go    Config, Environment, Endpoints, Load/Save, defaults
+internal/flink/flink.go      Flink/OpenSearch response types and all backend calls
+                             (FetchSchemas, ProcessNextOp, MoveAlias, ...)
+internal/ui/app.go           the App struct, tview widget setup (NewApp/Run)
+internal/ui/render.go        UI redraws: header, table, status panel, help bar
+internal/ui/actions.go       action handlers: stop/restart/delete/move,
+                             confirmation, environment/module switching
+internal/ui/keys.go          layout-independent keyboard shortcuts (handleKey)
+internal/ui/modals.go        modal dialogs: config, search, help
+test/config, test/flink      tests
 ```
 
 ## Supported operations
@@ -425,7 +468,7 @@ Deactivates a job/projection. Data stops updating.
 
 ```
 API: POST <schemaStop>
-Response: 204 No Content
+Response: any 2xx (normally 204 No Content)
 ```
 
 ### Start
@@ -435,12 +478,12 @@ Activates a job/projection so data starts updating again.
 ```
 API: POST <schemaStart>
 Body: {"startArg":[]}
-Response: 204 No Content
+Response: any 2xx (normally 204 No Content)
 ```
 
 ### Restart
 
-Runs Stop, then Start, in sequence. Used to reinitialize a job.
+Runs Stop, then Start, in sequence. Used to reinitialize a job. Start is retried up to 3 times (2 s apart) in case the job has not finished stopping yet.
 
 ```
 Operation: stop, then start
@@ -452,7 +495,7 @@ Removes a schema from Flink Admin and, optionally, its index from OpenSearch.
 
 ```
 API: DELETE <schemaDelete>?deleteIndex=false
-Response: 200 OK
+Response: any 2xx
 ```
 
 ### Move Alias
